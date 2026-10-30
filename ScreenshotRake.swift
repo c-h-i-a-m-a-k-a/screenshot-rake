@@ -1,4 +1,4 @@
-// Screenshot Rake: a squirrel rakes stray screenshots off your desktop
+// Screenshot Rake: Custodian Cashew the squirrel rakes stray screenshots off your desktop
 // and hauls them, a few at a time, into a "Leaf Pile" folder.
 
 import AppKit
@@ -11,7 +11,7 @@ struct Options {
     var dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
     var speed = 1.0
     var limit: Int?
-    var everyMinutes: Double?
+    var once = false
     var dryRun = false
     var mess: Int?
     var unrake = false
@@ -23,7 +23,7 @@ func usage() -> Never {
       --dir PATH     folder to rake (default: ~/Desktop)
       --speed X      animation speed multiplier (default: 1)
       --limit N      rake at most N screenshots
-      --every MIN    keep running and rake again every MIN minutes
+      --once         rake once and quit instead of staying in the menu bar
       --dry-run      play the animation without moving any files
       --mess N       create N fake screenshots in the folder, then exit
       --unrake       move everything out of Leaf Pile and scatter it, then exit
@@ -43,7 +43,7 @@ func parseOptions() -> Options {
         case "--dir": o.dir = URL(fileURLWithPath: (value() as NSString).expandingTildeInPath)
         case "--speed": o.speed = max(0.1, Double(value()) ?? 1)
         case "--limit": o.limit = Int(value())
-        case "--every": o.everyMinutes = Double(value())
+        case "--once": o.once = true
         case "--dry-run": o.dryRun = true
         case "--mess": o.mess = Int(value()) ?? 12
         case "--unrake": o.unrake = true
@@ -126,6 +126,64 @@ func findScreenshots() -> [URL] {
         let n = u.lastPathComponent.lowercased()
         return imageExts.contains(u.pathExtension.lowercased()) && screenshotPrefixes.contains { n.hasPrefix($0) }
     }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+}
+
+func pileContents() -> [URL] {
+    (try? fm.contentsOfDirectory(at: pileURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+}
+
+// MARK: - Settings (menu bar choices, remembered between launches)
+
+enum BatchMode: String, CaseIterable {
+    case randomFew, oldest10, all
+
+    var title: String {
+        switch self {
+        case .randomFew: return "Randomly a few"
+        case .oldest10: return "Oldest 10"
+        case .all: return "All"
+        }
+    }
+}
+
+enum Settings {
+    static let defaults = UserDefaults.standard
+    static let repeatChoices: [(hours: Double, title: String)] = [
+        (0, "Off"), (6, "Every 6 hours"), (12, "Every 12 hours"), (24, "Every day"), (168, "Every week"),
+    ]
+
+    static var batch: BatchMode {
+        get { BatchMode(rawValue: defaults.string(forKey: "batch") ?? "") ?? .all }
+        set { defaults.set(newValue.rawValue, forKey: "batch") }
+    }
+    /// 0 means off.
+    static var repeatHours: Double {
+        get { defaults.double(forKey: "repeatHours") }
+        set { defaults.set(newValue, forKey: "repeatHours") }
+    }
+    static var lastRake: Date? {
+        get { defaults.object(forKey: "lastRake") as? Date }
+        set { defaults.set(newValue, forKey: "lastRake") }
+    }
+    static var nextRake: Date? {
+        guard repeatHours > 0 else { return nil }
+        return (lastRake ?? Date()).addingTimeInterval(repeatHours * 3600)
+    }
+}
+
+/// The screenshots to rake this run, per the batch setting.
+func pickScreenshots() -> [URL] {
+    var urls = findScreenshots()
+    switch Settings.batch {
+    case .randomFew:
+        urls = Array(urls.shuffled().prefix(Int.random(in: 3...5)))
+    case .oldest10:
+        func created(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast }
+        urls = Array(urls.sorted { created($0) < created($1) }.prefix(10))
+    case .all:
+        break
+    }
+    return Array(urls.prefix(opts.limit ?? Int.max))
 }
 
 func thumbnail(_ url: URL, maxPixels: Int = 240) -> CGImage? {
@@ -393,9 +451,8 @@ func scatterOnDesktop(_ names: [String], screen: CGSize) {
 }
 
 func runUnrake(screen: CGSize) {
-    let urls = (try? fm.contentsOfDirectory(at: pileURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
     var names: [String] = []
-    for u in urls {
+    for u in pileContents() {
         let dest = uniqueURL(opts.dir.appendingPathComponent(u.lastPathComponent))
         if (try? fm.moveItem(at: u, to: dest)) != nil { names.append(dest.lastPathComponent) }
     }
@@ -474,8 +531,8 @@ final class Stage: NSView {
     override var isFlipped: Bool { true }
 
     let S: CGFloat = 1.15
-    let walkSpeed: CGFloat = 250
-    let rakeDuration = 1.6
+    let walkSpeed: CGFloat = 280
+    let rakeDuration = 1.4
 
     var W: CGFloat { bounds.width }
     var H: CGFloat { bounds.height }
@@ -522,10 +579,20 @@ final class Stage: NSView {
     // MARK: Setup
 
     func start() {
-        setupPile()
         timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
+        let schedule = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.checkSchedule() }
+        RunLoop.main.add(schedule, forMode: .common)
         beginRun()
+    }
+
+    func checkSchedule() {
+        guard !active, let next = Settings.nextRake, Date() >= next else { return }
+        if findScreenshots().isEmpty {
+            Settings.lastRake = Date()
+        } else {
+            beginRun()
+        }
     }
 
     func setupPile() {
@@ -550,7 +617,9 @@ final class Stage: NSView {
     }
 
     func beginRun() {
-        let urls = Array(findScreenshots().prefix(opts.limit ?? Int.max))
+        guard !active else { return }
+        setupPile()
+        let urls = pickScreenshots()
         let positions = isDesktop ? Finder.positions() : [:]
         var taken = [pile]
         items = urls.map { url in
@@ -684,7 +753,7 @@ final class Stage: NSView {
             pose = .rake
             facing = item.pos.x >= pos.x ? 1 : -1
             item.beingRaked = true
-            rakePhase += dt * 9
+            rakePhase += dt * 9.5
             item.jiggle = CGFloat(sin(rakePhase * 1.3)) * 3
             leafEmit -= dt
             if leafEmit <= 0 && actionT < rakeDuration - 0.3 {
@@ -774,30 +843,18 @@ final class Stage: NSView {
         if abs(d.x) > 2 { facing = d.x > 0 ? 1 : -1 }
         if dist <= stepLen { pos = target; return true }
         moving = true
-        walkPhase += dt * 13
+        walkPhase += dt * 14
         pos = pos + d.normalized * stepLen
         return false
     }
 
     func finishRun() {
         active = false
+        Settings.lastRake = Date()
         let verb = opts.dryRun ? "Would have raked" : "Raked"
         print("\(verb) \(raked) screenshot\(raked == 1 ? "" : "s") into \(pileURL.path)")
-        guard let minutes = opts.everyMinutes else {
+        if opts.once {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { NSApp.terminate(nil) }
-            return
-        }
-        print("Next rake in \(minutes) min")
-        scheduleNext(minutes)
-    }
-
-    func scheduleNext(_ minutes: Double) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + minutes * 60) {
-            if findScreenshots().isEmpty {
-                self.scheduleNext(minutes)
-            } else {
-                self.beginRun()
-            }
         }
     }
 
@@ -1002,6 +1059,105 @@ final class Stage: NSView {
     }
 }
 
+// MARK: - Menu bar
+
+final class MenuController: NSObject, NSMenuDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let stage: Stage
+
+    init(stage: Stage) {
+        self.stage = stage
+        super.init()
+        if let img = Sprites.frames["idle"] {
+            let h: CGFloat = 22
+            item.button?.image = NSImage(cgImage: img, size: NSSize(width: h * CGFloat(img.width) / CGFloat(img.height), height: h))
+        } else {
+            item.button?.title = "Rake"
+        }
+        item.button?.toolTip = "Screenshot Rake"
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        item.menu = menu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        add(menu, stage.active ? "Custodian Cashew is raking…" : "Send Custodian Cashew Now", #selector(rakeNow), enabled: !stage.active)
+        menu.addItem(.separator())
+
+        let batchMenu = NSMenu()
+        for mode in BatchMode.allCases {
+            let i = add(batchMenu, mode.title, #selector(setBatch(_:)))
+            i.representedObject = mode.rawValue
+            i.state = Settings.batch == mode ? .on : .off
+        }
+        menu.addItem(withTitle: "Batch Size", action: nil, keyEquivalent: "").submenu = batchMenu
+
+        let repeatMenu = NSMenu()
+        for choice in Settings.repeatChoices {
+            let i = add(repeatMenu, choice.title, #selector(setRepeat(_:)))
+            i.representedObject = choice.hours
+            i.state = Settings.repeatHours == choice.hours ? .on : .off
+        }
+        menu.addItem(withTitle: "Repeat", action: nil, keyEquivalent: "").submenu = repeatMenu
+        if let next = Settings.nextRake {
+            let f = DateFormatter()
+            f.doesRelativeDateFormatting = true
+            f.dateStyle = .short
+            f.timeStyle = .short
+            add(menu, "Next rake: \(f.string(from: next))", nil, enabled: false)
+        }
+        menu.addItem(.separator())
+
+        let count = pileContents().count
+        add(menu, "Open Leaf Pile", #selector(openPile), enabled: fm.fileExists(atPath: pileURL.path))
+        add(menu, count > 0 ? "Clear Leaf Pile (\(count))…" : "Clear Leaf Pile…", #selector(clearPile), enabled: count > 0 && !opts.dryRun)
+        menu.addItem(.separator())
+        add(menu, "Quit Screenshot Rake", #selector(quit))
+    }
+
+    @discardableResult
+    func add(_ menu: NSMenu, _ title: String, _ action: Selector?, enabled: Bool = true) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        i.target = self
+        i.isEnabled = enabled
+        menu.addItem(i)
+        return i
+    }
+
+    @objc func rakeNow() { stage.beginRun() }
+
+    @objc func setBatch(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let mode = BatchMode(rawValue: raw) { Settings.batch = mode }
+    }
+
+    @objc func setRepeat(_ sender: NSMenuItem) {
+        guard let hours = sender.representedObject as? Double else { return }
+        Settings.repeatHours = hours
+        Settings.lastRake = Date()
+    }
+
+    @objc func openPile() { NSWorkspace.shared.open(pileURL) }
+
+    @objc func clearPile() {
+        let files = pileContents()
+        guard !files.isEmpty else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Clear Leaf Pile?"
+        alert.informativeText = "This moves \(files.count) item\(files.count == 1 ? "" : "s") in Leaf Pile to the Trash."
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        for f in files {
+            do { try fm.trashItem(at: f, resultingItemURL: nil) } catch { print("Couldn't trash \(f.lastPathComponent): \(error.localizedDescription)") }
+        }
+    }
+
+    @objc func quit() { NSApp.terminate(nil) }
+}
+
 // MARK: - Main
 
 let app = NSApplication.shared
@@ -1033,5 +1189,6 @@ let stage = Stage(frame: NSRect(origin: .zero, size: screenFrame.size))
 window.contentView = stage
 window.setFrame(screenFrame, display: false)
 window.orderFrontRegardless()
+let menuController = opts.once ? nil : MenuController(stage: stage)
 stage.start()
 app.run()
