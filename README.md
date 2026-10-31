@@ -2,21 +2,23 @@
 
 Custodian Cashew, a squirrel with a rake, walks onto your desktop, rakes up stray screenshots 3–5 at a time, and hauls each batch into a **Leaf Pile** folder. The folder is created if it doesn't exist and gets a leaf-pile icon. The files really move.
 
-macOS only. Needs the Xcode command line tools (`swiftc`).
+macOS only. Building needs the Xcode command line tools (`swiftc`).
 
-The squirrel is drawn from `art/sprite-sheet.png`, which is cut into the frames in `art/frames/` (walk, rake, carry, idle and cheer). Keep `art/` next to the `rake` script.
-
-## Run
+## Install
 
 ```bash
-./rake
+./build-app
 ```
 
-The first run compiles the app. macOS may ask to let your terminal control Finder. Allow it, because that's how the squirrel finds each icon on the desktop.
+This builds **Screenshot Rake.app** and puts it in your Applications folder. Open it like any other app (Launchpad, Spotlight, or double-click) and a settings window opens with a **Rake Now** button and every option. Closing the window keeps Cashew running for scheduled rakes; click the Dock icon to bring the window back.
 
-Cashew rakes once right away, then stays in the menu bar.
+The first time, macOS asks to let Screenshot Rake control Finder. Allow it, because that's how the squirrel finds each icon on the desktop.
+
+To start it automatically, add it in **System Settings → General → Login Items**.
 
 ## Menu bar
+
+The same controls are also under the squirrel icon in the menu bar, plus **Settings…** to open the window.
 
 | Item | What it does |
 |------|--------------|
@@ -25,11 +27,14 @@ Cashew rakes once right away, then stays in the menu bar.
 | **Repeat** | Rake on a schedule: *Off*, *Every 6 hours*, *Every 12 hours*, *Every day*, *Every week* |
 | **Open Leaf Pile** | Open the folder in Finder |
 | **Clear Leaf Pile…** | Move everything in Leaf Pile to the Trash (asks first) |
+| **Make a Mess** | Scatter 12 fake screenshots on the desktop for Cashew to rake |
 | **Quit Screenshot Rake** | Quit. Repeats only run while the app is open. |
 
 Batch size and repeat are remembered between launches.
 
 ## Options
+
+The `rake` script runs the same app from the terminal, with extra options:
 
 | Flag | What it does |
 |------|--------------|

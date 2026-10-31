@@ -4,6 +4,7 @@
 import AppKit
 import ImageIO
 import QuartzCore
+import SwiftUI
 
 // MARK: - Options
 
@@ -38,6 +39,7 @@ func parseOptions() -> Options {
         guard !args.isEmpty else { usage() }
         return args.removeFirst()
     }
+    args.removeAll { $0.hasPrefix("-psn_") }
     while !args.isEmpty {
         switch args.removeFirst() {
         case "--dir": o.dir = URL(fileURLWithPath: (value() as NSString).expandingTildeInPath)
@@ -355,9 +357,10 @@ enum Sprites {
     static let dir: URL? = {
         let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
         return [
+            Bundle.main.resourceURL?.appendingPathComponent("art/frames"),
             exe.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("art/frames"),
             URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("art/frames"),
-        ].first { fm.fileExists(atPath: $0.appendingPathComponent("idle.png").path) }
+        ].compactMap { $0 }.first { fm.fileExists(atPath: $0.appendingPathComponent("idle.png").path) }
     }()
 
     static let frames: [String: CGImage] = {
@@ -578,12 +581,12 @@ final class Stage: NSView {
 
     // MARK: Setup
 
-    func start() {
+    func start(rakeNow: Bool = true) {
         timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
         let schedule = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.checkSchedule() }
         RunLoop.main.add(schedule, forMode: .common)
-        beginRun()
+        if rakeNow { beginRun() }
     }
 
     func checkSchedule() {
@@ -1084,6 +1087,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         add(menu, stage.active ? "Custodian Cashew is raking…" : "Send Custodian Cashew Now", #selector(rakeNow), enabled: !stage.active)
+        add(menu, "Settings…", #selector(showSettings))
         menu.addItem(.separator())
 
         let batchMenu = NSMenu()
@@ -1114,6 +1118,9 @@ final class MenuController: NSObject, NSMenuDelegate {
         add(menu, "Open Leaf Pile", #selector(openPile), enabled: fm.fileExists(atPath: pileURL.path))
         add(menu, count > 0 ? "Clear Leaf Pile (\(count))…" : "Clear Leaf Pile…", #selector(clearPile), enabled: count > 0 && !opts.dryRun)
         menu.addItem(.separator())
+
+        add(menu, "Make a Mess", #selector(makeMess), enabled: !stage.active && !busy)
+        menu.addItem(.separator())
         add(menu, "Quit Screenshot Rake", #selector(quit))
     }
 
@@ -1127,6 +1134,18 @@ final class MenuController: NSObject, NSMenuDelegate {
     }
 
     @objc func rakeNow() { stage.beginRun() }
+    @objc func showSettings() { SettingsWindow.shared.show() }
+
+    /// True while a mess or unrake is moving icons around, so they don't overlap.
+    var busy = false
+    func inBackground(_ work: @escaping () -> Void) {
+        busy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            work()
+            DispatchQueue.main.async { self.busy = false }
+        }
+    }
+    @objc func makeMess() { let s = screenFrame.size; inBackground { runMess(12, screen: s) } }
 
     @objc func setBatch(_ sender: NSMenuItem) {
         if let raw = sender.representedObject as? String, let mode = BatchMode(rawValue: raw) { Settings.batch = mode }
@@ -1158,10 +1177,167 @@ final class MenuController: NSObject, NSMenuDelegate {
     @objc func quit() { NSApp.terminate(nil) }
 }
 
+// MARK: - Settings window
+
+/// What the settings window shows. Re-read every second so counts stay current.
+final class SettingsModel: ObservableObject {
+    @Published var batch = Settings.batch { didSet { Settings.batch = batch } }
+    @Published var repeatHours = Settings.repeatHours {
+        didSet { Settings.repeatHours = repeatHours; Settings.lastRake = Date(); refresh() }
+    }
+    @Published var onDesktop = 0
+    @Published var inPile = 0
+    @Published var raking = false
+    @Published var busy = false
+    @Published var nextRake: Date?
+    private var timer: Timer?
+
+    init() {
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func refresh() {
+        onDesktop = findScreenshots().count
+        inPile = pileContents().count
+        raking = stage.active
+        busy = menuController?.busy ?? false
+        nextRake = Settings.nextRake
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 14) {
+                if let img = Sprites.frames["idle"] {
+                    Image(nsImage: NSImage(cgImage: img, size: NSSize(width: 84, height: 84 * CGFloat(img.height) / CGFloat(img.width))))
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Screenshot Rake").font(.title2.bold())
+                    Text("Custodian Cashew rakes the screenshots off your desktop into Leaf Pile.")
+                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    SettingsWindow.shared.hide()
+                    stage.beginRun()
+                } label: {
+                    Text(model.raking ? "Cashew is raking…" : "Rake Now").frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.raking || model.busy)
+                HStack {
+                    Text("\(model.onDesktop) screenshot\(model.onDesktop == 1 ? "" : "s") on your desktop right now")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Make a Mess") { menuController?.makeMess(); model.refresh() }
+                        .controlSize(.small)
+                        .disabled(model.raking || model.busy)
+                }
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Batch size", selection: $model.batch) {
+                        ForEach(BatchMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    Picker("Repeat", selection: $model.repeatHours) {
+                        ForEach(Settings.repeatChoices, id: \.hours) { Text($0.title).tag($0.hours) }
+                    }
+                    if let next = model.nextRake {
+                        Text("Next rake: \(next.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            GroupBox {
+                HStack {
+                    Text("Leaf Pile: \(model.inPile) item\(model.inPile == 1 ? "" : "s")")
+                    Spacer()
+                    Button("Open") { menuController?.openPile() }
+                        .disabled(!fm.fileExists(atPath: pileURL.path))
+                    Button("Clear…") { menuController?.clearPile(); model.refresh() }
+                        .disabled(model.inPile == 0)
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Text("Closing this window keeps Cashew running, so Repeat still works. Cashew also has a squirrel icon in the menu bar. Quit from the Dock or with ⌘Q.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(22)
+        .frame(width: 440)
+    }
+}
+
+final class SettingsWindow {
+    static let shared = SettingsWindow()
+    private var window: NSWindow?
+    private let model = SettingsModel()
+
+    func show() {
+        if window == nil {
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            w.title = "Screenshot Rake"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: SettingsView(model: model))
+            w.setContentSize(w.contentView!.fittingSize)
+            w.center()
+            window = w
+        }
+        model.refresh()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Get out of the way so the desktop is visible while Cashew rakes.
+    func hide() { window?.orderOut(nil) }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        SettingsWindow.shared.show()
+        return false
+    }
+}
+
+/// A standard app menu, so ⌘Q and ⌘W work when the app is opened from Finder.
+func installMainMenu() {
+    let main = NSMenu()
+    let appItem = NSMenuItem()
+    main.addItem(appItem)
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "Settings…", action: #selector(MenuController.showSettings), keyEquivalent: ",").target = menuController
+    appMenu.addItem(.separator())
+    appMenu.addItem(withTitle: "Quit Screenshot Rake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appItem.submenu = appMenu
+    let windowItem = NSMenuItem()
+    main.addItem(windowItem)
+    let windowMenu = NSMenu(title: "Window")
+    windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    windowItem.submenu = windowMenu
+    NSApp.mainMenu = main
+}
+
 // MARK: - Main
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+// Opened like a normal app (from Finder, the Dock or Spotlight, with no options): show a Dock icon and the
+// settings window instead of raking right away. From the `rake` script it stays a menu bar app as before.
+let launchedAsApp = Bundle.main.bundleURL.pathExtension == "app" && !CommandLine.arguments.dropFirst().contains { !$0.hasPrefix("-psn_") }
+app.setActivationPolicy(launchedAsApp ? .regular : .accessory)
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
 let screenFrame = NSScreen.screens.first?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
 if let n = opts.mess {
@@ -1190,5 +1366,11 @@ window.contentView = stage
 window.setFrame(screenFrame, display: false)
 window.orderFrontRegardless()
 let menuController = opts.once ? nil : MenuController(stage: stage)
-stage.start()
+if launchedAsApp {
+    installMainMenu()
+    stage.start(rakeNow: false)
+    SettingsWindow.shared.show()
+} else {
+    stage.start()
+}
 app.run()
